@@ -1,0 +1,604 @@
+#!/usr/bin/env bash
+#
+# ds4led-cli — утилита смены цвета lightbar-полоски геймпада DualShock 4 (PS4)
+#          на Linux, через sysfs LED интерфейс драйвера hid_playstation.
+#
+# Использование:
+#   ds4led-cli <цвет> [индекс|all]   — установить цвет (по умолчанию всем)
+#   ds4led-cli random [индекс|all]   — случайный заметный цвет
+#   ds4led-cli list                  — показать контроллеры (индекс, путь, текущий цвет)
+#   ds4led-cli --watch [сек]         — восстанавливать цвет после переподключения
+#   ds4led-cli --dry-run <цвет>      — показать, что было бы записано, не писать
+#   ds4led-cli install               — установить как службу systemd (sudo)
+#   ds4led-cli uninstall             — удалить службу и установленную копию (sudo)
+#   ds4led-cli --help | --version
+#
+# Цвет: aabbcc | #aabbcc | 0xaabbcc | R G B (три числа 0–255) | random
+#
+# Форматы записи (ядро >= 5.15, драйвер hid_playstation):
+#   /sys/class/leds/<dev>:red/brightness, ...:green, ...:blue  (0–255)
+#   /sys/class/leds/<dev>:global/brightness                   (0/1 — вкл/выкл)
+#   где <dev> — путь устройства вида 0003:054C:05C4.* / 0005:054C:09CC.*
+#   (0003 = USB, 0005 = Bluetooth; префикс inputN динамический — не используется).
+#
+# Конфиг: /etc/ds4led-cli.conf (color=rrggbb, interval=сек). Ручной цвет
+# (sudo ds4led-cli <цвет>) обновляет конфиг. Автозапуск: install + systemd.
+# Один файл заменяет и утилиту, и установщик (install.sh больше не нужен).
+#
+# Коды выхода: 0 успех, 1 неверные аргументы, 2 контроллер не найден,
+#              3 нет прав (нужен root), 4 ошибка записи.
+#
+# Внимание: запись в LED требует root. Запускайте через sudo.
+
+set -euo pipefail
+
+PROGNAME="ds4led-cli"
+VERSION="0.1.0"
+
+# Коды выхода
+EXIT_OK=0
+EXIT_USAGE=1
+EXIT_NO_CONTROLLER=2
+# shellcheck disable=SC2034  # используются начиная с этапа 4 (запись)
+EXIT_NO_PERMISSION=3
+# shellcheck disable=SC2034  # используются начиная с этапа 4 (запись)
+EXIT_WRITE_FAILED=4
+
+usage() {
+    sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-$EXIT_OK}"
+}
+
+cmd_version() {
+    echo "$PROGNAME $VERSION"
+    exit "$EXIT_OK"
+}
+
+# ---------------------------------------------------------------------------
+# Обнаружение контроллеров (этап 2)
+# ---------------------------------------------------------------------------
+
+LEDS_DIR="/sys/class/leds"
+
+# Найденные контроллеры (заполняет find_controllers)
+CONTROLLER_PREFIX=()   # префикс имён LED, напр. "input17" (динамический!)
+CONTROLLER_DEVPATH=()  # каталог устройства, напр. "0005:054C:09CC.0004"
+
+n_controllers() { echo "${#CONTROLLER_PREFIX[@]}"; }
+
+# Поиск DS4 в /sys/class/leds.
+# Группируем по родительскому каталогу устройства (054C:05C4 — DS4 v1,
+# 054C:09CC — DS4 v2), т.к. префикс inputN меняется при переподключении.
+# Канал :red служит маркером, green/blue обязательны для заливки цвета.
+find_controllers() {
+    CONTROLLER_PREFIX=()
+    CONTROLLER_DEVPATH=()
+    local led dev base
+    for led in "$LEDS_DIR"/*:red; do
+        [ -e "$led" ] || continue
+        # readlink даёт .../<устройство>/leds/<префикс>:red — нужно срезать
+        # два уровня: имя LED и каталог leds.
+        dev=$(basename "$(dirname "$(dirname "$(readlink -f "$led")")")")
+        case "$dev" in
+            [0-9][0-9][0-9][0-9]:054C:05C4.*|[0-9][0-9][0-9][0-9]:054C:09CC.*)
+                # 0003 = USB, 0005 = Bluetooth — матчим любую HID-шину
+                base=${led%:red}
+                if [ -f "$base:green/brightness" ] && [ -f "$base:blue/brightness" ]; then
+                    CONTROLLER_PREFIX+=("$(basename "$base")")
+                    CONTROLLER_DEVPATH+=("$dev")
+                fi
+                ;;
+        esac
+    done
+}
+
+# Текущий цвет контроллера: строка "R G B"
+read_color() { # read_color <префикс>
+    printf '%s %s %s\n' \
+        "$(<"$LEDS_DIR/$1:red/brightness")" \
+        "$(<"$LEDS_DIR/$1:green/brightness")" \
+        "$(<"$LEDS_DIR/$1:blue/brightness")"
+}
+
+# Диагностика, когда контроллеры не найдены (перед exit 2)
+explain_no_controller() {
+    if [ ! -d "$LEDS_DIR" ]; then
+        echo "Подсказка: $LEDS_DIR не существует — ядро без поддержки leds?" >&2
+        return
+    fi
+    # LED от геймпада есть, но не похожи на hid_playstation -> legacy hid_sony
+    if grep -q '^hid_sony' /proc/modules 2>/dev/null; then
+        echo "Подсказка: загружен устаревший драйвер hid_sony без sysfs-каналов R/G/B." >&2
+        echo "Нужно ядро >= 5.15 с драйвером hid_playstation." >&2
+    elif grep -qE '^hid_playstation' /proc/modules 2>/dev/null; then
+        echo "Подсказка: драйвер hid_playstation загружен, но DS4 не найден." >&2
+        echo "Проверьте USB-кабель/Bluetooth-сопряжение (драйвер подключает" >&2
+        echo "устройство через uhid, LED появляются после сопряжения)." >&2
+    else
+        echo "Подсказка: драйвер hid_playstation не загружен. Подключите DS4" >&2
+        echo "по USB или Bluetooth и повторите." >&2
+    fi
+}
+
+cmd_list() {
+    find_controllers
+    local n i prefix rgb glob_br
+    n=$(n_controllers)
+    if [ "$n" -eq 0 ]; then
+        echo "$PROGNAME: DualShock 4 не найден" >&2
+        explain_no_controller
+        exit "$EXIT_NO_CONTROLLER"
+    fi
+    printf '%-3s %-10s %-22s %-9s %s\n' '#' 'префикс' 'устройство' 'цвет RGB' 'global'
+    for i in "${!CONTROLLER_PREFIX[@]}"; do
+        prefix=${CONTROLLER_PREFIX[$i]}
+        rgb=$(read_color "$prefix")
+        glob_br=$(<"$LEDS_DIR/$prefix:global/brightness")
+        printf '%-3s %-10s %-22s %-9s %s\n' \
+            "$((i + 1))" "$prefix" "${CONTROLLER_DEVPATH[$i]}" "$rgb" "$glob_br"
+    done
+    exit "$EXIT_OK"
+}
+# ---------------------------------------------------------------------------
+# Парсер цвета и выбор цели (этап 3)
+# ---------------------------------------------------------------------------
+
+DRY_RUN=0     # 1 = только показать, что было бы записано
+INDEX="all"   # "all" или номер контроллера из ds4led-cli list (1..N)
+RGB=""        # результат парсинга: "R G B"
+
+is_byte() { [[ $1 =~ ^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[0-9]{1,2})$ ]]; }
+
+parse_hex() { # parse_hex <aabbcc|#aabbcc|0xaabbcc>
+    local h=$1
+    case $h in
+        \#*)    h=${h#\#} ;;
+        0[xX]*) h=${h#0?} ;;
+    esac
+    if [[ ! $h =~ ^[0-9A-Fa-f]{6}$ ]]; then
+        die "$EXIT_USAGE" "неверный цвет '$1': нужен hex aabbcc / #aabbcc / 0xaabbcc, RGB '255 0 0' или random"
+    fi
+    RGB="$((16#${h:0:2})) $((16#${h:2:2})) $((16#${h:4:2}))"
+}
+
+# Случайный цвет, но заметный: хотя бы один канал >= 64 (иначе почти чёрный)
+gen_random() {
+    local r g b max
+    while :; do
+        r=$((RANDOM % 256)); g=$((RANDOM % 256)); b=$((RANDOM % 256))
+        max=$((r > g ? (r > b ? r : b) : (g > b ? g : b)))
+        [ "$max" -ge 64 ] && break
+    done
+    RGB="$r $g $b"
+}
+
+cmd_set_color() {
+    local a args=()
+    for a in "$@"; do
+        case $a in
+            --dry-run) DRY_RUN=1 ;;
+            *)         args+=("$a") ;;
+        esac
+    done
+
+    find_controllers
+    if [ "$(n_controllers)" -eq 0 ]; then
+        echo "$PROGNAME: DualShock 4 не найден" >&2
+        explain_no_controller
+        exit "$EXIT_NO_CONTROLLER"
+    fi
+
+    # Последний аргумент может быть индексом ("all" | 1..N)
+    local argc=${#args[@]}
+    if [ "$argc" -eq 2 ] || [ "$argc" -eq 4 ]; then
+        case ${args[$((argc - 1))]} in
+            all) ;;
+            [1-9]|[1-9][0-9])
+                INDEX=${args[$((argc - 1))]}
+                if [ "$INDEX" -gt "$(n_controllers)" ]; then
+                    die "$EXIT_USAGE" "контроллера с индексом $INDEX нет (доступно: $(n_controllers), см. '$PROGNAME list')"
+                fi
+                ;;
+            *) die "$EXIT_USAGE" "неверный индекс '${args[$((argc - 1))]}' (число 1..$(n_controllers) или all)" ;;
+        esac
+        unset 'args[$((argc - 1))]'
+    fi
+
+    # Остаток аргументов: 1 = hex/random, 3 = RGB-триплет
+    argc=${#args[@]}
+    if [ "$argc" -eq 1 ]; then
+        case ${args[0]} in
+            random) gen_random ;;
+            *)      parse_hex "${args[0]}" ;;
+        esac
+    elif [ "$argc" -eq 3 ] && is_byte "${args[0]}" && is_byte "${args[1]}" && is_byte "${args[2]}"; then
+        RGB="${args[0]} ${args[1]} ${args[2]}"
+    else
+        die "$EXIT_USAGE" "неверные аргументы. Примеры: $PROGNAME ff0000 | $PROGNAME '#00ff88' 2 | $PROGNAME 255 0 0 | $PROGNAME random"
+    fi
+
+    apply_color
+}
+
+apply_color() { # выборка контроллеров уже валидна; RGB и INDEX установлены
+    local r=${RGB%% *} b=${RGB##* }
+    local g; g=${RGB#* }; g=${g%% *}
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "DRY-RUN: цвет $RGB, цель: $INDEX. Было бы записано:"
+        local i prefix
+        for i in "${!CONTROLLER_PREFIX[@]}"; do
+            [ "$INDEX" = "all" ] || [ "$((i + 1))" = "$INDEX" ] || continue
+            prefix=${CONTROLLER_PREFIX[$i]}
+            echo "  $LEDS_DIR/$prefix:red/brightness   = $r"
+            echo "  $LEDS_DIR/$prefix:green/brightness = $g"
+            echo "  $LEDS_DIR/$prefix:blue/brightness  = $b"
+            echo "  $LEDS_DIR/$prefix:global/brightness= 1"
+        done
+        exit "$EXIT_OK"
+    fi
+
+    # Запись требует root
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "$PROGNAME: ошибка: запись в LED требует root." >&2
+        echo "Запустите: sudo $PROGNAME $RGB ${INDEX:+$INDEX}" >&2
+        exit "$EXIT_NO_PERMISSION"
+    fi
+
+    local i prefix fail=0
+    for i in "${!CONTROLLER_PREFIX[@]}"; do
+        [ "$INDEX" = "all" ] || [ "$((i + 1))" = "$INDEX" ] || continue
+        prefix=${CONTROLLER_PREFIX[$i]}
+        if set_color_on "$prefix" "$r" "$g" "$b"; then
+            echo "$PROGNAME: контроллер $((i + 1)) (${CONTROLLER_DEVPATH[$i]}): цвет $RGB установлен"
+        else
+            echo "$PROGNAME: ошибка: контроллер $((i + 1)) (${CONTROLLER_DEVPATH[$i]}): не удалось записать цвет" >&2
+            fail=$((fail + 1))
+        fi
+    done
+
+    # Сохраняем только при полной успешности всех целей
+    [ "$fail" -eq 0 ] && save_last_color
+    # Ручной цвет обновляет и конфиг (решение пользователя)
+    [ "$fail" -eq 0 ] && update_config_color "$r" "$g" "$b"
+    [ "$fail" -eq 0 ] || exit "$EXIT_WRITE_FAILED"
+    exit "$EXIT_OK"
+}
+
+# Запись цвета в один контроллер. Возвращает 1 при любой ошибке записи,
+# чтобы вызывающий код мог сообщить по каждому контроллеру отдельно.
+set_color_on() { # set_color_on <префикс> <R> <G> <B>
+    local prefix=$1 r=$2 g=$3 b=$4 file
+    for file in "red:$r" "green:$g" "blue:$b" "global:1"; do
+        if ! printf '%s\n' "${file#*:}" > "$LEDS_DIR/$prefix:${file%%:*}/brightness"; then
+            return 1
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Сохранение цвета и режим --watch (этап 6)
+# ---------------------------------------------------------------------------
+
+# Состояние хранится в домашнем каталоге того, под кем запущен скрипт.
+# Так как и запись цвета, и --watch выполняются через sudo, файл будет
+# в /root/.local/state/ds4led-cli/ — оба режима видят одно и то же.
+STATE_DIR="${XDG_STATE_HOME:-${HOME:-/root}/.local/state}/ds4led-cli"
+STATE_FILE="$STATE_DIR/last_color"
+LAST_COLOR=""
+
+save_last_color() { # вызывается после успешной установки цвета; best effort
+    if mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s\n' "$RGB" > "$STATE_FILE" 2>/dev/null; then
+        return 0
+    fi
+    echo "$PROGNAME: предупреждение: не удалось сохранить цвет в $STATE_FILE" >&2
+    return 0 # не мешаем основному результату
+}
+
+load_last_color() {
+    [ -r "$STATE_FILE" ] || return 1
+    local v; v=$(<"$STATE_FILE")
+    [[ $v =~ ^[0-9]{1,3}\ [0-9]{1,3}\ [0-9]{1,3}$ ]] || return 1
+    LAST_COLOR=$v
+}
+
+cmd_watch() {
+    local interval=${1:-}
+    case $interval in
+        ''|*[!0-9]*) [ -z "$interval" ] || die "$EXIT_USAGE" "интервал должен быть числом секунд: $PROGNAME --watch [сек]" ;;
+    esac
+    if [ -n "$interval" ] && [ "$interval" -lt 1 ]; then
+        die "$EXIT_USAGE" "интервал должен быть >= 1 секунды"
+    fi
+
+    # Конфиг читаем до root-проверки, чтобы warning'и были видны всем
+    load_config || true
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "$PROGNAME: ошибка: watch-режим пишет в LED и требует root." >&2
+        echo "Запустите: sudo $PROGNAME --watch [сек]" >&2
+        exit "$EXIT_NO_PERMISSION"
+    fi
+
+    local target=""
+    [ -n "$CFG_COLOR" ] && target=$CFG_COLOR
+    if [ -z "$target" ] && load_last_color; then
+        target=$LAST_COLOR
+    fi
+    if [ -z "$target" ]; then
+        echo "$PROGNAME: ошибка: нечего восстанавливать." >&2
+        echo "Задайте цвет в $CONFIG_FILE (color=rrggbb) или выполните sudo $PROGNAME <цвет>" >&2
+        exit "$EXIT_USAGE"
+    fi
+
+    # CLI-аргумент перекрывает interval из конфига
+    local cur_interval=${CFG_INTERVAL:-3}
+    [ -n "$interval" ] && cur_interval=$interval
+
+    echo "$PROGNAME: watch-режим: цвет $target, интервал ${cur_interval}с, конфиг $CONFIG_FILE, Ctrl+C — выход"
+    # Автозапуск (по желанию, вручную):
+    #   /etc/systemd/system/ds4led-cli.service
+    #     [Unit]
+    #     Description=ds4led-cli color watch
+    #     [Service]
+    #     ExecStart=/usr/local/bin/ds4led-cli --watch
+    #     [Install]
+    #     WantedBy=multi-user.target
+    #   Затем: sudo cp ds4led-cli /usr/local/bin/ && sudo systemctl enable --now ds4led-cli
+    trap 'echo; echo "$PROGNAME: watch остановлен"; exit 0' INT TERM
+
+    local cfg_mtime=""
+    [ -f "$CONFIG_FILE" ] && cfg_mtime=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null || echo "")
+
+    local i prefix cur cfg_mtime_new
+    while :; do
+        # Конфиг менялся на диске? Перечитываем (контроллеры, чей цвет
+        # теперь отличается, восстановятся на новом тике автоматически).
+        if [ -f "$CONFIG_FILE" ]; then
+            cfg_mtime_new=$(stat -c %Y "$CONFIG_FILE" 2>/dev/null || echo "")
+            if [ "$cfg_mtime_new" != "$cfg_mtime" ]; then
+                cfg_mtime=$cfg_mtime_new
+                load_config || true
+                if [ -n "$CFG_COLOR" ] && [ "$CFG_COLOR" != "$target" ]; then
+                    target=$CFG_COLOR
+                    echo "$(date +%H:%M:%S): конфиг изменён: новый цвет $target"
+                fi
+                if [ -z "$interval" ] && [ -n "$CFG_INTERVAL" ]; then
+                    cur_interval=$CFG_INTERVAL
+                fi
+            fi
+        fi
+
+        local r=${target%% *} b=${target##* }
+        local g; g=${target#* }; g=${g%% *}
+
+        find_controllers
+        for i in "${!CONTROLLER_PREFIX[@]}"; do
+            prefix=${CONTROLLER_PREFIX[$i]}
+            cur=$(read_color "$prefix")
+            if [ "$cur" != "$target" ]; then
+                if set_color_on "$prefix" "$r" "$g" "$b"; then
+                    echo "$(date +%H:%M:%S): ${CONTROLLER_DEVPATH[$i]}: цвет применён ($target)"
+                else
+                    echo "$(date +%H:%M:%S): ${CONTROLLER_DEVPATH[$i]}: не удалось записать цвет" >&2
+                fi
+            fi
+        done
+        sleep "$cur_interval"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Конфиг /etc/ds4led-cli.conf (этап 9)
+# ---------------------------------------------------------------------------
+
+CONFIG_FILE="${DS4LED_CONFIG:-/etc/ds4led-cli.conf}"
+CFG_COLOR=""     # "R G B" или пусто
+CFG_INTERVAL=""  # секунды или пусто
+
+load_config() {
+    CFG_COLOR=""
+    CFG_INTERVAL=""
+    [ -r "$CONFIG_FILE" ] || return 1
+    local line k v
+    while IFS= read -r line; do
+        line=${line%%#*}              # срезаем комментарии
+        line=${line//[[:space:]]/}    # и пробелы (формат допускает ' color = ff0000 ')
+        [[ $line == *=* ]] || continue
+        k=${line%%=*}
+        v=${line#*=}
+        case $k in
+            color)
+                if [[ $v =~ ^[0-9A-Fa-f]{6}$ ]]; then
+                    parse_hex "$v"
+                    CFG_COLOR=$RGB
+                else
+                    echo "$PROGNAME: предупреждение: $CONFIG_FILE: некорректный color='$v'" >&2
+                fi
+                ;;
+            interval)
+                if [[ $v =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ]; then
+                    CFG_INTERVAL=$v
+                else
+                    echo "$PROGNAME: предупреждение: $CONFIG_FILE: некорректный interval='$v'" >&2
+                fi
+                ;;
+            *) echo "$PROGNAME: предупреждение: $CONFIG_FILE: неизвестный ключ '$k'" >&2 ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+# Ручной цвет становится новым значением в конфиге (решение пользователя — (в)).
+update_config_color() { # update_config_color <R> <G> <B>
+    local hex
+    hex=$(printf '%02x%02x%02x' "$1" "$2" "$3")
+    if [ -f "$CONFIG_FILE" ] && grep -q '^color=' "$CONFIG_FILE"; then
+        # sed -i пересоздаёт файл от имени текущего пользователя (root) и
+        # отнял бы у владельца право править без sudo — восстанавливаем.
+        local owner="" mode=""
+        if [ "$(id -u)" -eq 0 ]; then
+            owner=$(stat -c %U "$CONFIG_FILE" 2>/dev/null || echo "")
+            mode=$(stat -c %a "$CONFIG_FILE" 2>/dev/null || echo "")
+        fi
+        if sed -i "s/^color=.*/color=$hex/" "$CONFIG_FILE" 2>/dev/null; then
+            [ -n "$mode" ] && chmod "$mode" "$CONFIG_FILE" 2>/dev/null || :
+            if [ -n "$owner" ] && [ "$owner" != "root" ]; then
+                chown "$owner" "$CONFIG_FILE" 2>/dev/null || :
+            fi
+            return 0
+        fi
+        echo "$PROGNAME: предупреждение: не удалось обновить $CONFIG_FILE" >&2
+        return 0
+    else
+        mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null
+        if printf 'color=%s\n' "$hex" >> "$CONFIG_FILE" 2>/dev/null; then
+            return 0
+        fi
+        echo "$PROGNAME: предупреждение: не удалось записать $CONFIG_FILE" >&2
+        return 0
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Установка как службы systemd (одним файлом, этап 12)
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "$PROGNAME: ошибка: установка требует root." >&2
+        echo "Запустите: sudo $PROGNAME install" >&2
+        exit "$EXIT_NO_PERMISSION"
+    fi
+
+    local dst="/usr/local/bin/$PROGNAME"
+    # Копируем сам файл; если запуск уже из установленной копии — не трогаем.
+    if [ "$(readlink -f "$0")" != "$dst" ]; then
+        install -m 755 "$0" "$dst"
+        echo "$PROGNAME: скопирован в $dst"
+    else
+        echo "$PROGNAME: уже запущен из $dst, копирование не требуется"
+    fi
+
+    echo "$PROGNAME: пишу юнит -> /etc/systemd/system/$PROGNAME.service"
+    cat > "/etc/systemd/system/$PROGNAME.service" <<'__DS4LED_UNIT__'
+[Unit]
+Description=ds4led-cli — поддержание цвета lightbar DualShock 4 (из /etc/ds4led-cli.conf)
+
+[Service]
+ExecStart=/usr/local/bin/ds4led-cli --watch
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+__DS4LED_UNIT__
+
+    # Разовая миграция со старого имени ds4led: убрать старую службу,
+    # старую копию и перенести конфиг под новым именем.
+    if [ -f /etc/systemd/system/ds4led.service ]; then
+        systemctl disable --now ds4led.service 2>/dev/null || true
+        rm -f /etc/systemd/system/ds4led.service
+        echo "$PROGNAME: удалена служба со старым именем (ds4led.service)"
+    fi
+    [ -f /usr/local/bin/ds4led ] && rm -f /usr/local/bin/ds4led
+    if [ -f /etc/ds4led.conf ] && [ ! -f "$CONFIG_FILE" ]; then
+        mv /etc/ds4led.conf "$CONFIG_FILE"
+        chmod 666 "$CONFIG_FILE"
+        echo "$PROGNAME: конфиг мигрирован: /etc/ds4led.conf -> $CONFIG_FILE"
+    fi
+    # Старый state-каталог (последний ручной цвет)
+    if [ -d "/root/.local/state/ds4led" ] && [ ! -e "$STATE_DIR" ]; then
+        mkdir -p "$(dirname "$STATE_DIR")"
+        mv "/root/.local/state/ds4led" "$STATE_DIR"
+        echo "$PROGNAME: состояние мигрировано в $STATE_DIR"
+    fi
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        printf 'color=ff0000\ninterval=3\n' > "$CONFIG_FILE"
+        echo "$PROGNAME: создан $CONFIG_FILE (по умолчанию ff0000) — отредактируйте под себя"
+    else
+        echo "$PROGNAME: $CONFIG_FILE уже существует — не трогаю"
+    fi
+
+    # Разрешаем всем пользователям читать и править конфиг без sudo.
+    # При запуске из-под чистого root право всё равно ставится.
+    chmod 666 "$CONFIG_FILE" 2>/dev/null || true
+    if [ -n "${SUDO_USER:-}" ]; then
+        if chown "$SUDO_USER" "$CONFIG_FILE" 2>/dev/null; then
+            echo "$PROGNAME: конфиг 666, владелец $SUDO_USER — правится любым пользователем без sudo"
+        fi
+    fi
+
+    systemctl daemon-reload
+    systemctl enable --now "$PROGNAME.service"
+    echo "$PROGNAME: готово. Статус: systemctl status $PROGNAME"
+    exit "$EXIT_OK"
+}
+
+cmd_uninstall() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "$PROGNAME: ошибка: удаление требует root." >&2
+        echo "Запустите: sudo $PROGNAME uninstall" >&2
+        exit "$EXIT_NO_PERMISSION"
+    fi
+
+    local dst="/usr/local/bin/$PROGNAME"
+    local unit="/etc/systemd/system/$PROGNAME.service"
+
+    # Останавливаем и отключаем службу (если она есть)
+    if [ -f "$unit" ]; then
+        systemctl disable --now "$PROGNAME.service" 2>/dev/null || \
+            echo "$PROGNAME: предупреждение: systemctl disable завершился с ошибкой (служба не была активна?)" >&2
+        rm -f "$unit"
+        systemctl daemon-reload
+        echo "$PROGNAME: служба удалена ($unit)"
+    else
+        echo "$PROGNAME: служба не найдена ($unit) — пропускаю"
+    fi
+
+    # Установленная копия; если запуск из неё — предупредить
+    if [ -f "$dst" ]; then
+        if [ "$(readlink -f "$0")" = "$dst" ]; then
+            echo "$PROGNAME: внимание: это установленная копия ($dst)." >&2
+            echo "Файл будет удалён после завершения работы команды — это нормально." >&2
+        fi
+        rm -f "$dst"
+        echo "$PROGNAME: копия удалена ($dst)"
+    else
+        echo "$PROGNAME: копия не найдена ($dst) — пропускаю"
+    fi
+
+    # Конфиг и state не трогаем: цвет пользователя сохранится для
+    # повторной установки. Сообщаем, где лежат, чтобы можно было удалить вручную.
+    echo "$PROGNAME: не тронуты (удалите вручную при желании):"
+    [ -f "$CONFIG_FILE" ] && echo "  конфиг: $CONFIG_FILE"
+    [ -f "$STATE_FILE" ] && echo "  состояние: $STATE_FILE"
+    exit "$EXIT_OK"
+}
+
+die() { # die <код_выхода> <сообщение>
+    echo "$PROGNAME: ошибка: $2" >&2
+    exit "$1"
+}
+
+main() {
+    # Вычленяем --config из любых позиций, остальное — команде
+    local a args=()
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --config)    CONFIG_FILE=${2:-}; shift 2 ;;
+            --config=*)  CONFIG_FILE=${1#*=}; shift ;;
+            *)           args+=("$1"); shift ;;
+        esac
+    done
+    case "${args[0]:-}" in
+        --help|-h|help)  usage ;;
+        --version|-V)    cmd_version ;;
+        install)         cmd_install ;;
+        uninstall)       cmd_uninstall ;;
+        list)            shift; cmd_list "${args[@]:1}" ;;
+        --watch)         cmd_watch "${args[@]:1}" ;;
+        *)               cmd_set_color "${args[@]}" ;;
+    esac
+}
+
+main "$@"
