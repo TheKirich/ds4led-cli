@@ -21,8 +21,11 @@
 #   где <dev> — путь устройства вида 0003:054C:05C4.* / 0005:054C:09CC.*
 #   (0003 = USB, 0005 = Bluetooth; префикс inputN динамический — не используется).
 #
-# Конфиг: /etc/ds4led-cli.conf (color=rrggbb, interval=сек). Ручной цвет
-# (sudo ds4led-cli <цвет>) обновляет конфиг. Автозапуск: install + systemd.
+# Конфиг: /etc/ds4led-cli.conf (color=rrggbb, interval=сек, force=yes|no).
+# force=yes: watch-перезаписывает цвет безусловно каждый тик — нужно, когда
+# цвет lightbar меняют сторонние программы (Steam/игры) напрямую через hidraw:
+# такая запись не отражается в sysfs, и сравнение её не замечает.
+# Ручной цвет (sudo ds4led-cli <цвет>) обновляет конфиг. Автозапуск: install + systemd.
 # Один файл заменяет и утилиту, и установщик (install.sh больше не нужен).
 #
 # Коды выхода: 0 успех, 1 неверные аргументы, 2 контроллер не найден,
@@ -334,7 +337,11 @@ cmd_watch() {
     local cur_interval=${CFG_INTERVAL:-3}
     [ -n "$interval" ] && cur_interval=$interval
 
-    echo "$PROGNAME: watch-режим: цвет $target, интервал ${cur_interval}с, конфиг $CONFIG_FILE, Ctrl+C — выход"
+    local force_write=0
+    [ "$CFG_FORCE" -eq 1 ] && force_write=1
+    local force_note=""
+    [ "$force_write" -eq 1 ] && force_note=", force-перезапись"
+    echo "$PROGNAME: watch-режим: цвет $target, интервал ${cur_interval}с${force_note}, конфиг $CONFIG_FILE, Ctrl+C — выход"
     # Автозапуск (по желанию, вручную):
     #   /etc/systemd/system/ds4led-cli.service
     #     [Unit]
@@ -375,9 +382,13 @@ cmd_watch() {
         for i in "${!CONTROLLER_PREFIX[@]}"; do
             prefix=${CONTROLLER_PREFIX[$i]}
             cur=$(read_color "$prefix")
-            if [ "$cur" != "$target" ]; then
+            # force: пишем безусловно (sysfs может врать — Steam/игры пишут
+            # в hidraw мимо драйвера); логируем только реальные изменения.
+            if [ "$cur" != "$target" ] || [ "$force_write" -eq 1 ]; then
                 if set_color_on "$prefix" "$r" "$g" "$b"; then
-                    echo "$(date +%H:%M:%S): ${CONTROLLER_DEVPATH[$i]}: цвет применён ($target)"
+                    if [ "$cur" != "$target" ]; then
+                        echo "$(date +%H:%M:%S): ${CONTROLLER_DEVPATH[$i]}: цвет применён ($target)"
+                    fi
                 else
                     echo "$(date +%H:%M:%S): ${CONTROLLER_DEVPATH[$i]}: не удалось записать цвет" >&2
                 fi
@@ -394,10 +405,12 @@ cmd_watch() {
 CONFIG_FILE="${DS4LED_CONFIG:-/etc/ds4led-cli.conf}"
 CFG_COLOR=""     # "R G B" или пусто
 CFG_INTERVAL=""  # секунды или пусто
+CFG_FORCE=0      # 1 = watch перезаписывает цвет безусловно (reassert-режим)
 
 load_config() {
     CFG_COLOR=""
     CFG_INTERVAL=""
+    CFG_FORCE=0
     [ -r "$CONFIG_FILE" ] || return 1
     local line k v
     while IFS= read -r line; do
@@ -421,6 +434,13 @@ load_config() {
                 else
                     echo "$PROGNAME: предупреждение: $CONFIG_FILE: некорректный interval='$v'" >&2
                 fi
+                ;;
+            force)
+                case $v in
+                    yes|1|true)  CFG_FORCE=1 ;;
+                    no|0|false)  CFG_FORCE=0 ;;
+                    *) echo "$PROGNAME: предупреждение: $CONFIG_FILE: некорректный force='$v'" >&2 ;;
+                esac
                 ;;
             *) echo "$PROGNAME: предупреждение: $CONFIG_FILE: неизвестный ключ '$k'" >&2 ;;
         esac
@@ -595,7 +615,7 @@ main() {
         --version|-V)    cmd_version ;;
         install)         cmd_install ;;
         uninstall)       cmd_uninstall ;;
-        list)            shift; cmd_list "${args[@]:1}" ;;
+        list)            cmd_list "${args[@]:1}" ;;
         --watch)         cmd_watch "${args[@]:1}" ;;
         *)               cmd_set_color "${args[@]}" ;;
     esac
